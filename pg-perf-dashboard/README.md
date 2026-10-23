@@ -20,6 +20,13 @@ Lo script è sicuro da lanciare in produzione: la sessione è `read only`, con
 `statement_timeout = 30s` e `lock_timeout = 3s`, e le dimensioni delle tabelle sono lette da
 `pg_class` per non restare bloccato dietro a DDL o `LOCK TABLE` in corso.
 
+Il report include grafici (barre HTML/CSS, nessuna libreria esterna, tooltip al passaggio del
+mouse): connessioni per stato rispetto al massimo, letture da disco per database, età XID rispetto
+al limite di wraparound, checkpoint a tempo/richiesti, chi scrive i buffer (checkpointer, bgwriter,
+backend), I/O per tipo di processo (16+), query più costose, tuple morte, sequential scan e tabelle
+più grandi. Le barre di stato usano verde/giallo/rosso con le soglie disegnate come linee.
+I grafici sono solo nell'HTML: il JSON resta invariato.
+
 Codice di uscita: `0` tutto OK, `1` almeno un'attenzione, `2` almeno un critico. Comodo per
 cron o per un sistema di monitoraggio.
 

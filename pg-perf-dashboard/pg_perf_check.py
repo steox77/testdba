@@ -63,6 +63,7 @@ class Section:
         self.status = OK
         self.findings = []  # (status, testo)
         self.tables = []    # (titolo, colonne, righe)
+        self.charts = []    # grafici per il report HTML (non inclusi nel JSON)
 
     def add(self, status, text):
         self.findings.append((status, text))
@@ -72,6 +73,10 @@ class Section:
         if rows:
             columns = columns or list(rows[0].keys())
         self.tables.append((title, columns or [], rows))
+
+    def chart(self, kind, **spec):
+        spec["kind"] = kind
+        self.charts.append(spec)
 
     def to_dict(self):
         return {
@@ -253,6 +258,18 @@ class Checker:
         if long_idle:
             sec.add(WARN, "%d sessioni idle in transaction da oltre 5 minuti: tengono lock e "
                           "bloccano il vacuum." % len(long_idle))
+        by_state = {}
+        for r in rows:
+            st = r["stato"]
+            st = "idle in transaction" if st.startswith("idle in transaction") else \
+                st if st in ("active", "idle") else "altro"
+            by_state[st] = by_state.get(st, 0) + r["sessioni"]
+        avail = max(max_conn - reserved, 1)
+        sec.chart("stacked", title="Connessioni client per stato", total=avail,
+                  series=[("attive", 1), ("idle", 2), ("idle in transaction", 3), ("altro", 4)],
+                  rows=[("in uso / %d" % avail, [by_state.get(k, 0) for k in
+                                                 ("active", "idle", "idle in transaction", "altro")])],
+                  note="La parte grigia sono le connessioni ancora disponibili.")
         sec.table("Sessioni per stato", rows)
         sec.table("Sessioni idle in transaction", idle_tx)
         sec.table("Sessioni per utente/applicazione", self.query("""
@@ -294,6 +311,13 @@ class Checker:
             WHERE state = 'active' AND wait_event IS NOT NULL AND pid <> pg_backend_pid()
             GROUP BY 1, 2 ORDER BY 3 DESC
         """)
+        by_type = {}
+        for w in waits:
+            by_type[w["tipo_attesa"]] = by_type.get(w["tipo_attesa"], 0) + w["sessioni"]
+        if by_type:
+            sec.chart("bars", title="Sessioni attive in attesa, per tipo di wait event",
+                      items=[{"label": k, "value": v} for k, v in
+                             sorted(by_type.items(), key=lambda kv: -kv[1])])
         sec.table("Wait event delle sessioni attive", waits)
         progress = self.query("""
             SELECT p.pid, p.datname AS database, p.relid::regclass::text AS tabella, p.phase AS fase,
@@ -382,6 +406,18 @@ class Checker:
         self.kpi["cache_hit"] = float(total_hit) if total_hit is not None else None
         if not sec.findings:
             sec.add(OK, "Cache hit, rollback e file temporanei nella norma.")
+        miss = []
+        for r in rows:
+            if r["cache_hit_pct"] is None:
+                continue
+            m = 100 - float(r["cache_hit_pct"])
+            miss.append({"label": r["database"], "value": m, "display": "%.2f%%" % m,
+                         "status": CRIT if m > 5 else WARN if m > 1 else OK,
+                         "tip": "%s: hit %.2f%%, letture da disco %.2f%%" % (
+                             r["database"], float(r["cache_hit_pct"]), m)})
+        sec.chart("bars", title="Letture da disco (blocchi non trovati in cache)",
+                  items=miss[:10], thresholds=[1, 5],
+                  note="Più corta è meglio. Linee: 1% attenzione, 5% critico (cache hit 99% e 95%).")
         sec.table("Database", rows)
         self.sections.append(sec)
 
@@ -403,6 +439,14 @@ class Checker:
             sec.add(WARN, "Un database ha superato il 50% del limite XID.")
         else:
             sec.add(OK, "Età massima XID al %.1f%% del limite." % top)
+        sec.chart("bars", title="Età XID in % del limite di wraparound", max_value=100,
+                  thresholds=[50, 75], note="Linee: 50% attenzione, 75% critico.",
+                  items=[{"label": r["database"], "value": float(r["pct_limite_xid"]),
+                          "display": "%.1f%%" % float(r["pct_limite_xid"]),
+                          "status": CRIT if r["pct_limite_xid"] >= 75 else
+                          WARN if r["pct_limite_xid"] >= 50 else OK,
+                          "tip": "%s: %s transazioni di età" % (r["database"], r["eta_xid"])}
+                         for r in rows[:10]])
         sec.table("Database", rows)
         sec.table("Tabelle più vecchie (database corrente)", self.query("""
             SELECT c.oid::regclass::text AS tabella, age(c.relfrozenxid) AS eta_xid,
@@ -465,6 +509,18 @@ class Checker:
                     bg["stop_maxwritten"])
         if not sec.findings:
             sec.add(OK, "Checkpoint nella norma (%d totali)." % total)
+        sec.chart("stacked", title="Checkpoint a tempo e richiesti",
+                  series=[("a tempo (checkpoint_timeout)", 1), ("richiesti (WAL pieno o manuali)", 2)],
+                  rows=[("checkpoint", [cp["a_tempo"] or 0, cp["richiesti"] or 0])],
+                  note="Se prevalgono i richiesti, max_wal_size è troppo basso.")
+        writers = [("checkpointer", 1), ("bgwriter", 2)]
+        written = [cp["buffer_scritti"] or 0, bg["buffer_bgwriter"] or 0]
+        if "buffer_backend" in bg:
+            writers.append(("backend", 3))
+            written.append(bg["buffer_backend"] or 0)
+        sec.chart("stacked", title="Chi scrive i buffer sporchi su disco", series=writers,
+                  rows=[("buffer", written)],
+                  note="Idealmente scrivono checkpointer e bgwriter, non i backend.")
         sec.table("Checkpoint", [cp])
         sec.table("Background writer", [bg])
         self.sections.append(sec)
@@ -522,6 +578,15 @@ class Checker:
                           "shared_buffers o bgwriter sottodimensionati.")
         else:
             sec.add(OK, "Distribuzione dell'I/O nella norma.")
+        per_proc = {}
+        for r in rows:
+            acc = per_proc.setdefault(r["processo"], [0, 0, 0])
+            acc[0] += r["letture"]
+            acc[1] += r["scritture"]
+            acc[2] += r["estensioni"]
+        sec.chart("stacked", title="Operazioni di I/O per tipo di processo",
+                  series=[("letture", 1), ("scritture", 2), ("estensioni", 3)],
+                  rows=sorted(per_proc.items(), key=lambda kv: -sum(kv[1]))[:8])
         sec.table("pg_stat_io", rows)
         self.sections.append(sec)
 
@@ -561,6 +626,12 @@ class Checker:
             slow = [r for r in rows if (r["media_ms"] or 0) > 1000 and r["chiamate"] > 10]
             if slow:
                 sec.add(WARN, "%d query frequenti hanno tempo medio > 1 s." % len(slow))
+        sec.chart("bars", title="Query per tempo totale di esecuzione",
+                  items=[{"label": r["query"][:60], "value": float(r["pct_tempo"] or 0),
+                          "display": "%s s · %s%%" % (r["totale_s"], r["pct_tempo"]),
+                          "tip": "%s\n%s chiamate, media %s ms" % (r["query"], r["chiamate"],
+                                                                  r["media_ms"])}
+                         for r in rows[:10]])
         sec.table("Top query per tempo totale", rows)
         sec.table("Top query per tempo medio (almeno 10 chiamate)", self.query("""
             SELECT s.queryid::text AS queryid, s.calls AS chiamate,
@@ -602,6 +673,14 @@ class Checker:
             sec.add(WARN, "%d tabelle grandi senza statistiche (mai analizzate)." % len(never))
         if not sec.findings:
             sec.add(OK, "Nessuna tabella con bloat significativo da tuple morte.")
+        sec.chart("bars", title="Tuple morte in % per tabella", max_value=100, thresholds=[20],
+                  note="Linea: 20%, oltre la quale autovacuum non tiene il passo.",
+                  items=[{"label": r["tabella"], "value": float(r["pct_morte"] or 0),
+                          "display": "%s%%" % r["pct_morte"],
+                          "status": WARN if r in bad else OK,
+                          "tip": "%s: %s tuple morte su %s vive" % (
+                              r["tabella"], r["tuple_morte"], r["tuple_vive"])}
+                         for r in rows[:10]])
         sec.table("Tabelle con più tuple morte", rows)
         sec.table("Tabelle mai analizzate", never)
         self.sections.append(sec)
@@ -624,6 +703,10 @@ class Checker:
             sec.add(WARN, "%d tabelle sopra i 10MB lette prevalentemente in sequential scan." % len(heavy))
         else:
             sec.add(OK, "Nessuna tabella grande dominata da sequential scan.")
+        sec.chart("bars", title="Tuple lette in sequential scan",
+                  items=[{"label": r["tabella"], "value": r["tuple_lette_seq"],
+                          "tip": "%s: %s seq scan, %s%% delle scansioni" % (
+                              r["tabella"], r["seq_scan"], r["pct_seq"])} for r in rows[:10]])
         sec.table("Tabelle per tuple lette in sequential scan", rows)
         self.sections.append(sec)
 
@@ -677,7 +760,7 @@ class Checker:
         rows = self.query("""
             SELECT n.nspname || '.' || c.relname AS tabella,
                    pg_size_pretty(@TOTAL_BYTES@) AS totale,
-                   pg_size_pretty(c.relpages * @BLK@) AS dati,
+                   pg_size_pretty(c.relpages * @BLK@) AS dati, @TOTAL_BYTES@ AS _byte,
                    c.reltuples::bigint AS righe_stimate
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relkind IN ('r', 'm', 'p')
@@ -686,6 +769,9 @@ class Checker:
             ORDER BY @TOTAL_BYTES@ DESC LIMIT %s
         """, (self.top_n,))
         sec.add(INFO, "Le %d tabelle più grandi del database corrente." % len(rows))
+        sizes = [(r["tabella"], r.pop("_byte"), r["totale"]) for r in rows]
+        sec.chart("bars", title="Dimensione totale delle tabelle più grandi",
+                  items=[{"label": t, "value": b, "display": d} for t, b, d in sizes[:10]])
         sec.table("Tabelle", rows)
         self.sections.append(sec)
 
@@ -757,10 +843,12 @@ class Checker:
 CSS = """
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1c2330;--muted:#5d6675;--line:#e2e5ea;
 --ok:#1f8a4c;--okbg:#e5f4ea;--warn:#a86400;--warnbg:#fdf1dc;--crit:#c0352b;--critbg:#fbe4e2;
---info:#2f5fb3;--infobg:#e6eefb;--na:#6b7280;--nabg:#eef0f3}
+--info:#2f5fb3;--infobg:#e6eefb;--na:#6b7280;--nabg:#eef0f3;
+--c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--c4:#eda100;--good:#0ca30c;--warning:#fab219;--critical:#d03b3b}
 @media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--fg:#e6e9ef;--muted:#9aa3b2;
 --line:#2c3340;--ok:#5cc98a;--okbg:#173524;--warn:#f0b454;--warnbg:#3a2c12;--crit:#f27c72;
---critbg:#3d1d1a;--info:#7fa8f0;--infobg:#1b2a44;--na:#a0a7b4;--nabg:#262b34}}
+--critbg:#3d1d1a;--info:#7fa8f0;--infobg:#1b2a44;--na:#a0a7b4;--nabg:#262b34;
+--c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
 font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 .wrap{max-width:1280px;margin:0 auto;padding:24px 16px 64px}
@@ -782,6 +870,25 @@ border-radius:999px;padding:3px 10px;font-size:12px}
 .s-ok{color:var(--ok);background:var(--okbg)}.s-warn{color:var(--warn);background:var(--warnbg)}
 .s-crit{color:var(--crit);background:var(--critbg)}.s-info{color:var(--info);background:var(--infobg)}
 .s-na{color:var(--na);background:var(--nabg)}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:12px;margin:12px 0 4px}
+.chart{margin:0;border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.chart figcaption{font-weight:600;font-size:13px;margin-bottom:8px}
+.chart .note{color:var(--muted);font-size:12px;margin-top:8px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--muted);margin-bottom:6px}
+.legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;
+margin-right:6px;vertical-align:-1px;background:var(--sw)}
+.row{display:grid;grid-template-columns:minmax(80px,30%) minmax(0,1fr) auto;gap:10px;align-items:center;
+margin:5px 0;font-size:12.5px;outline:none}
+.row .lbl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trk{position:relative;height:16px;display:flex;gap:2px}
+.trk.cap{background:var(--line);border-radius:0 4px 4px 0}
+.trk i{display:block;height:100%;min-width:2px;border-radius:0 4px 4px 0}
+.trk.st i{border-radius:0}.trk.st i:last-of-type{border-radius:0 4px 4px 0}
+.trk .th{position:absolute;top:-3px;bottom:-3px;width:1px;background:var(--muted)}
+.row .val{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
+.row:hover .lbl,.row:focus .lbl{text-decoration:underline}
+#tip{position:fixed;display:none;z-index:9;max-width:420px;white-space:pre-wrap;background:var(--fg);
+color:var(--bg);font-size:12px;padding:6px 9px;border-radius:6px;pointer-events:none}
 .dot{background:none}
 ul.f{list-style:none;padding:0;margin:8px 0}ul.f li{display:flex;gap:8px;align-items:baseline;margin:4px 0}
 .tw{overflow-x:auto;border:1px solid var(--line);border-radius:8px}
@@ -839,6 +946,87 @@ def render_table(title, columns, rows):
     return "".join(out)
 
 
+def compact(v):
+    v = float(v)
+    for suffix, div in (("G", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(v) >= div:
+            return ("%.1f" % (v / div)).rstrip("0").rstrip(".") + suffix
+    return ("%.2f" % v).rstrip("0").rstrip(".")
+
+
+def attr(text):
+    return html.escape(str(text), quote=True)
+
+
+STATUS_COLOR = {OK: "var(--good)", WARN: "var(--warning)", CRIT: "var(--critical)"}
+
+
+def render_bars(c):
+    items = c["items"]
+    if not items:
+        return ""
+    thresholds = c.get("thresholds", [])
+    top = c.get("max_value") or max([it["value"] for it in items] +
+                                    [t * 1.15 for t in thresholds]) or 1
+    out = []
+    for it in items:
+        status = it.get("status")
+        value = it.get("display") or compact(it["value"])
+        if status in (WARN, CRIT):
+            value += " · " + STATUS_LABEL[status].lower()
+        marks = "".join("<b class='th' style='left:%.2f%%'></b>" % (100.0 * t / top)
+                        for t in thresholds)
+        out.append("<div class='row' tabindex='0' data-tip='%s'><div class='lbl'>%s</div>"
+                   "<div class='trk'><i style='width:%.2f%%;background:%s'></i>%s</div>"
+                   "<div class='val'>%s</div></div>" % (
+                       attr(it.get("tip") or "%s: %s" % (it["label"], value)), esc(it["label"]),
+                       min(100.0, 100.0 * it["value"] / top), STATUS_COLOR.get(status, "var(--c1)"),
+                       marks, esc(value)))
+    return "".join(out)
+
+
+def render_stacked(c):
+    rows = [(label, vals) for label, vals in c["rows"] if sum(vals) > 0 or c.get("total")]
+    if not rows:
+        return ""
+    series = c["series"]
+    total = c.get("total") or max(sum(v) for _, v in rows) or 1
+    out = ["<div class='legend'>%s</div>" % "".join(
+        "<span style='--sw:var(--c%d)'>%s</span>" % (slot, esc(name)) for name, slot in series)]
+    for label, vals in rows:
+        segs = "".join("<i style='width:calc(%.3f%% - 2px);background:var(--c%d)' data-tip='%s'></i>" % (
+            100.0 * v / total, slot, attr("%s · %s: %s" % (label, name, compact(v))))
+            for (name, slot), v in zip(series, vals) if v > 0)
+        detail = ", ".join("%s %s" % (name, compact(v)) for (name, _), v in zip(series, vals))
+        out.append("<div class='row' tabindex='0' data-tip='%s'><div class='lbl'>%s</div>"
+                   "<div class='trk st%s'>%s</div><div class='val'>%s</div></div>" % (
+                       attr("%s: %s" % (label, detail)), esc(label),
+                       " cap" if c.get("total") else "", segs, esc(compact(sum(vals)))))
+    return "".join(out)
+
+
+def render_chart(c):
+    body = render_bars(c) if c["kind"] == "bars" else render_stacked(c)
+    if not body:
+        return ""
+    note = "<div class='note'>%s</div>" % esc(c["note"]) if c.get("note") else ""
+    return "<figure class='chart'><figcaption>%s</figcaption>%s%s</figure>" % (
+        esc(c["title"]), body, note)
+
+
+TOOLTIP_JS = """<div id="tip" role="tooltip"></div><script>
+(function(){var t=document.getElementById('tip');
+function show(el,x,y){t.textContent=el.getAttribute('data-tip');t.style.display='block';
+t.style.left=Math.max(8,Math.min(x+14,innerWidth-t.offsetWidth-8))+'px';
+t.style.top=Math.min(y+16,innerHeight-t.offsetHeight-8)+'px';}
+document.addEventListener('pointermove',function(e){var el=e.target.closest('[data-tip]');
+if(el)show(el,e.clientX,e.clientY);else t.style.display='none';});
+document.addEventListener('focusin',function(e){var el=e.target.closest('[data-tip]');
+if(el){var r=el.getBoundingClientRect();show(el,r.left+r.width/3,r.bottom-8);}});
+document.addEventListener('focusout',function(){t.style.display='none';});})();
+</script>"""
+
+
 def render_html(checker):
     data = checker.to_dict()
     k = data["kpi"]
@@ -872,6 +1060,9 @@ def render_html(checker):
         for st, text in sec.findings:
             body.append("<li>%s<span>%s</span></li>" % (badge(st), esc(text)))
         body.append("</ul>")
+        charts = "".join(render_chart(c) for c in sec.charts)
+        if charts:
+            body.append("<div class='charts'>%s</div>" % charts)
         for t in sec.tables:
             body.append(render_table(*t))
         body.append("</section>")
@@ -885,8 +1076,9 @@ def render_html(checker):
 <div class="sub">Generato il %s · server_version_num %s · statistiche per tabella/indice riferite al database <b>%s</b></div>
 <div class="tiles">%s</div><nav class="nav">%s</nav>%s
 <footer>Generato da pg_perf_check.py. Le statistiche cumulative partono dall'ultimo reset (pg_stat_reset) o riavvio.</footer>
-</div></body></html>""" % (CSS, data["generated_at"], data["server_version_num"],
-                          esc(k.get("database", "")), "".join(tiles), nav, "".join(body))
+</div>%s</body></html>""" % (CSS, data["generated_at"], data["server_version_num"],
+                          esc(k.get("database", "")), "".join(tiles), nav, "".join(body),
+                          TOOLTIP_JS)
 
 
 def main():
