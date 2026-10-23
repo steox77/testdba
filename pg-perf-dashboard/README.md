@@ -64,3 +64,36 @@ Le sezioni non disponibili sulla versione analizzata compaiono come "N/D". Se un
 
 `./test_matrix.sh` avvia PostgreSQL 11–18 in Docker, genera carico con `pgbench` e produce un
 report per versione in `reports/`. Richiede Docker, `psql` e `pgbench`.
+
+## Agent analyzer: indicazioni dal report
+
+`pg_report_analyzer.py` legge il report e lo fa analizzare a Claude (Opus 5.5), che restituisce
+raccomandazioni ordinate per priorità (alta, media, bassa), ognuna con problema, numeri del report
+che la giustificano, azione da fare, comandi SQL pronti, rischi e se serve un riavvio.
+
+```bash
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...
+python3 pg_perf_check.py --dsn "postgresql://monitor@dbhost/mydb" -o report.html
+python3 pg_report_analyzer.py report.html -o analisi.md --html analisi.html
+```
+
+Accetta sia il JSON di `--json` sia il file HTML: i report HTML nuovi contengono i dati grezzi
+incorporati, quelli generati prima vengono ricostruiti leggendo le tabelle.
+
+Con `--dsn` l'analyzer diventa un agente che può fare query di verifica sul database (per esempio
+leggere la definizione degli indici o l'`EXPLAIN` di una query lenta) prima di dare le indicazioni:
+
+```bash
+python3 pg_report_analyzer.py report.html --dsn "postgresql://monitor@dbhost/mydb"
+```
+
+Le query passano da una sessione `read only` con `statement_timeout = 15s`, sono ammesse solo
+`SELECT`, `WITH`, `SHOW` ed `EXPLAIN` senza `ANALYZE`, una istruzione per volta, al massimo 200
+righe per risposta e 15 query per analisi (`--max-queries`).
+
+Altre opzioni: `--json` salva l'analisi strutturata, `--effort` (`low` … `max`, default `high`)
+regola quanto Claude ragiona, `--model` cambia modello. Il report e i risultati delle query
+vengono inviati all'API di Anthropic: contengono testi delle query, nomi di tabelle e utenti.
+
+`python3 test_analyzer.py` verifica l'analyzer senza chiamare l'API.

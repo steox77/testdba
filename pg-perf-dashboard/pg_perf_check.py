@@ -885,8 +885,11 @@ def render_html(checker):
 <div class="sub">Generato il %s · server_version_num %s · statistiche per tabella/indice riferite al database <b>%s</b></div>
 <div class="tiles">%s</div><nav class="nav">%s</nav>%s
 <footer>Generato da pg_perf_check.py. Le statistiche cumulative partono dall'ultimo reset (pg_stat_reset) o riavvio.</footer>
-</div></body></html>""" % (CSS, data["generated_at"], data["server_version_num"],
-                          esc(k.get("database", "")), "".join(tiles), nav, "".join(body))
+</div><script type="application/json" id="pg-perf-data">%s</script></body></html>""" % (
+        CSS, data["generated_at"], data["server_version_num"], esc(k.get("database", "")),
+        "".join(tiles), nav, "".join(body),
+        # Dati grezzi per pg_report_analyzer.py; "</" va spezzato per non chiudere lo <script>
+        json.dumps(data, default=str, ensure_ascii=False).replace("</", "<\\/"))
 
 
 def main():
