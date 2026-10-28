@@ -42,13 +42,23 @@ cat > config/constraints.txt <<'EOF'
 # pg-airman-mcp 1.1.1 non e' compatibile con mcp 2.x (FastMCP rimosso): bloccare a 1.x
 mcp<2
 EOF
+# pg-airman-mcp 1.1.1 dichiara pglast==7.2.0, che non e' piu' su PyPI: lo si installa
+# senza dipendenze e le sue dipendenze si elencano qui, con pglast 7.21 (verificato).
+# python-dotenv e' importato da pg-airman-mcp ma non dichiarato tra le dipendenze.
 cat > config/requirements.txt <<'EOF'
-pg-airman-mcp==1.1.1
+attrs>=25.3.0
+humanize>=4.8.0
+instructor>=1.7.9
+mcp>=1.9.2
+pglast==7.21
+psycopg-pool>=3.2.6
+psycopg[c]>=3.2.8
+pyjwt[crypto]>=2.12.1
 python-dotenv
 ollmcp
 EOF
-# python-dotenv e' importato da pg-airman-mcp ma non dichiarato tra le dipendenze.
 "$PY" -m pip download -d wheels -r config/requirements.txt -c config/constraints.txt pip setuptools wheel
+"$PY" -m pip download -d wheels --no-deps pg-airman-mcp==1.1.1
 # psycopg-c arriva come sorgente: verra' compilato sul server (gcc, libpq-devel, python3.12-devel).
 ls wheels | tee config/wheels.txt
 

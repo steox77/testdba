@@ -74,8 +74,11 @@ ollama list
 echo ">> pg-airman-mcp e ollmcp (venv offline)"
 python3.12 -m venv "$PREFIX/venv"
 "$PREFIX/venv/bin/pip" install --no-index --find-links "$BUNDLE/wheels" --upgrade pip setuptools wheel
-"$PREFIX/venv/bin/pip" install --no-index --find-links "$BUNDLE/wheels" \
+# --no-build-isolation: psycopg-c si compila con il setuptools del venv, senza scaricarne altri
+"$PREFIX/venv/bin/pip" install --no-index --find-links "$BUNDLE/wheels" --no-build-isolation \
   -r "$BUNDLE/config/requirements.txt" -c "$BUNDLE/config/constraints.txt"
+# Senza dipendenze: il suo vincolo pglast==7.2.0 non e' installabile (vedi 02_prepara_bundle.sh)
+"$PREFIX/venv/bin/pip" install --no-index --find-links "$BUNDLE/wheels" --no-deps pg-airman-mcp==1.1.1
 "$PREFIX/venv/bin/pg-airman-mcp" --help >/dev/null && echo "pg-airman-mcp OK"
 ln -sf "$PREFIX/venv/bin/ollmcp" /usr/local/bin/ollmcp
 cp "$BUNDLE/collaudo.py" "$BUNDLE/domande_collaudo.json" "$PREFIX/" 2>/dev/null || true
